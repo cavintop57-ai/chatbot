@@ -197,7 +197,7 @@ def render_bot_message(text: str, images_field: str | None = None):
                     try:
                         st.image(url, use_container_width=True)
                     except Exception:
-                        st.markdown("<div class='small-note'>이미지를 직접 불러오지 못했어요. 아래 버튼을 눌러 새 탭에서 확인해 보세요 👇</div>", unsafe_allow_html=True)
+                        st.markdown("<div class='small-note'>사진을 준비했어요. 아래 버튼을 누르면 답변에 준비된 사진을 확인하실 수 있습니다~! 👇</div>", unsafe_allow_html=True)
                         # Streamlit 1.25+ : 링크 버튼
                         st.link_button("이미지 열기 (새 탭)", url)
 
