@@ -1,11 +1,11 @@
 # app.py — "🗨️그린(GREEN)톡톡💚" (B모드: 임베딩만, 생성 없음)
 # 요구사항 반영:
+#  - Google 스프레드시트 CSV를 우선 로드 (실패 시 로컬 엑셀 자동 인식)
 #  - 별도 파란 박스 제거, 페이지 채팅 영역 전체를 연파랑 배경으로
 #  - 카톡형 말풍선(사용자 오른쪽, 봇 왼쪽)
 #  - 스몰톡(인사/이름/기능/나이/만든 사람/이해못함)
-#  - 엑셀 자동 인식(한글 파일명 포함, 우선순위 + 최신 수정)
 #  - 첫 메시지: intent 목록을 친절히 안내 후 “무엇이 궁금하세요?”
-#  - ✅ 엑셀 images 컬럼 지원(선택): "assets/a.png; https://.../b.jpg" 형식, 최대 3장 표시
+#  - ✅ 엑셀/시트 images 컬럼 지원: "assets/a.png; https://.../b.jpg" 형식, 최대 3장 표시
 
 import os, glob, re, time
 import numpy as np
@@ -15,8 +15,11 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# ===== (시연용) API Key — 배포 시 환경변수/Secrets 사용 권장 =====
+# ===== (시연용) API Key 하드코딩 =====
 API_KEY = "AIzaSyBklAdqxHazyHmEyJO6LD3kPzANiqc6u3o"
+
+# ===== Google 스프레드시트 CSV URL (하드코딩) =====
+GSHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRuh7Qmg1YFrj1IleUs0QJmCBFfb7Cgu_7prj-LmrcovxD-s2ON1Q86ENi27BUwZdpqOqrCCdJDrKmW/pub?output=csv"
 
 # ===== 정책/문구 =====
 SIM_THRESHOLD = 0.82
@@ -102,13 +105,16 @@ def _clean_images_field(val) -> str:
 
 # ===== KB 빌드 (✅ images 포함) =====
 def build_kb(df: pd.DataFrame):
+    """
+    필요 컬럼: intent, answer, q1~q5(최소 q1~q3), images(선택)
+    """
     rows = []
     for _, r in df.iterrows():
         answer = str(r.get("answer", "")).strip()
         if not answer:    # answer 필수
             continue
         intent = str(r.get("intent", "")).strip()
-        images = _clean_images_field(r.get("images", ""))  # <<< 추가: images 컬럼(선택)
+        images = _clean_images_field(r.get("images", ""))  # 선택 컬럼
         qs = [str(r.get(f"q{i}", "")).strip() for i in range(1,6) if str(r.get(f"q{i}", "")).strip()]
         if len(qs) < 3:   # 최소 3개 질문 변형
             continue
@@ -127,7 +133,7 @@ def retrieve_top1(query: str, kb_rows, kb_mat):
     idx = int(np.argmax(scores))
     return kb_rows[idx], float(scores[idx])
 
-# ===== 엑셀 자동 인식 =====
+# ===== 엑셀 자동 인식 (로컬 폴백) =====
 def auto_find_excel():
     cwd = os.getcwd()
     prefer = [os.path.join(cwd, "qa.xlsx"),
@@ -145,6 +151,31 @@ def auto_find_excel():
 def load_excel(path: str):
     df = pd.read_excel(path)
     return build_kb(df)
+
+# ===== (신규) 스프레드시트 우선 로더 =====
+def load_excel_or_gsheet():
+    # 1) 구글시트 CSV 먼저 시도
+    if GSHEET_CSV_URL:
+        try:
+            df = pd.read_csv(GSHEET_CSV_URL)
+            kb = build_kb(df)
+            if kb:
+                return kb, "gsheet"
+            else:
+                st.warning("스프레드시트에 유효한 Q&A가 없습니다. (answer 필수, q1~q3 이상 필요)")
+        except Exception as e:
+            st.warning(f"스프레드시트(CSV) 로드 실패, 로컬 엑셀을 시도합니다: {e}")
+
+    # 2) 로컬 엑셀 폴백
+    path = auto_find_excel()
+    if path:
+        try:
+            kb = load_excel(path)
+            return kb, path
+        except Exception as e:
+            st.error(f"엑셀 로드 실패: {e}")
+            return None, None
+    return None, None
 
 # ===== 스몰톡(규칙 기반) =====
 def smalltalk_reply(text: str):
@@ -187,7 +218,7 @@ def prettify_intents(intents: list[str]) -> str:
     # 보기 좋게 쉼표로 연결
     return ", ".join(cleaned)
 
-# ===== (새로 추가) 렌더 유틸: 봇 메시지 + 이미지 =====
+# ===== 렌더 유틸: 봇/유저 메시지 (봇은 이미지 지원) =====
 def render_bot_message(text: str, images_field: str | None = None):
     # 텍스트 버블
     st.markdown(f'<div class="msg-row left"><div class="msg bot">{text}</div></div>', unsafe_allow_html=True)
@@ -212,17 +243,17 @@ if "kb" not in st.session_state:          st.session_state.kb = None
 if "messages" not in st.session_state:    st.session_state.messages = []  # [{role,text,images?,ts}]
 if "welcomed" not in st.session_state:    st.session_state.welcomed = False  # 첫 안내 메시지 중복 방지
 
-# ===== KB 자동 로드 + 첫 안내 =====
+# ===== KB 로드(스프레드시트 우선) + 첫 안내 =====
 if st.session_state.kb is None:
-    xls = auto_find_excel()
-    if xls:
-        try:
-            kb = load_excel(xls)
-            st.session_state.kb = kb
-        except Exception as e:
-            st.error(f"엑셀 자동 로드 실패: {e}")
+    kb, source = load_excel_or_gsheet()
+    if kb:
+        st.session_state.kb = kb
+        if source == "gsheet":
+            st.caption("현재 지식베이스: Google 스프레드시트(CSV)에서 불러왔어요.")
+        elif isinstance(source, str):
+            st.caption(f"현재 지식베이스: 로컬 파일에서 불러왔어요. ({os.path.basename(source)})")
     else:
-        st.info("같은 폴더에 엑셀(.xlsx)을 두면 자동 인식합니다. (예: qa.xlsx)")
+        st.info("GSHEET_CSV_URL에서 불러오지 못했습니다. 같은 폴더에 엑셀(.xlsx)을 두면 자동 인식합니다. (예: qa.xlsx)")
 
 # KB가 있고 아직 환영 메시지를 안 보냈다면 intents로 첫 메시지 안내
 if st.session_state.kb and not st.session_state.welcomed:
@@ -262,7 +293,7 @@ if user_input:
         top_row, top_score = retrieve_top1(user_input, kb_rows, kb_mat)
         if top_row is not None and top_score >= SIM_THRESHOLD:
             reply = top_row["answer"]
-            reply_images = _clean_images_field(top_row.get("images"))  # <<< 매칭된 행의 images 사용
+            reply_images = _clean_images_field(top_row.get("images"))  # 매칭된 행의 images 사용
 
     # 2) 스몰톡
     if reply is None:
