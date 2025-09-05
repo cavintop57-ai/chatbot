@@ -2,7 +2,8 @@
 # - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
 # - 컬럼명 자동 정규화
 # - 카톡형 UI, 스몰톡, 첫 안내
-# - ✅ images 컬럼: "이미지 미리보기" 버튼 → 모달로 표시 (모달 내 로드 실패 시 새 탭 버튼 안내)
+# - ✅ images 컬럼: "이미지 미리보기" 버튼 → 모달로 표시
+#    (모달에서 로드 실패 시 새 탭 버튼으로 자연스럽게 유도)
 
 import os, glob, re, time
 import numpy as np
@@ -182,24 +183,25 @@ def smalltalk_reply(text: str):
         return "저는 선생님과 함께 만들어진 GREEN 톡톡이에요."
     return None
 
-# ===== 모달(다이얼로그)로 이미지 미리보기 =====
-def open_image_modal(url: str):
-    with st.dialog("이미지 미리보기", width="large"):
-        try:
-            st.image(url, use_container_width=True)
-        except Exception:
-            st.markdown(
-                "<div class='small-note'>이 이미지는 보안 정책 때문에 직접 표시가 어려워요. 아래 버튼을 눌러 새 탭에서 확인해 보세요 👇</div>",
-                unsafe_allow_html=True
-            )
-            st.link_button("이미지 열기 (새 탭)", url)
+# ===== 모달(다이얼로그) — 데코레이터 방식으로 정의 후 호출 =====
+@st.dialog("이미지 미리보기", width="large")
+def image_modal(url: str):
+    try:
+        st.image(url, use_container_width=True)
+    except Exception:
+        st.markdown(
+            "<div class='small-note'>이 이미지는 보안 정책 때문에 직접 표시가 어려워요. "
+            "아래 버튼을 눌러 <b>새 탭</b>에서 확인해 보세요 👇</div>",
+            unsafe_allow_html=True
+        )
+        st.link_button("이미지 열기 (새 탭)", url)
 
 # ===== 렌더 유틸 =====
 def render_bot_message(text: str, images_field: str | None = None):
     # 텍스트 말풍선
     st.markdown(f'<div class="msg-row left"><div class="msg bot">{text}</div></div>', unsafe_allow_html=True)
 
-    # 이미지가 있으면: "미리보기 버튼"만 제공 → 클릭 시 모달로 크게 보기
+    # 이미지가 있으면: "미리보기" 버튼 → 클릭 시 모달 오픈
     if images_field:
         paths = [p.strip() for p in str(images_field).split(";") if p.strip()]
         if paths:
@@ -207,9 +209,9 @@ def render_bot_message(text: str, images_field: str | None = None):
             cols = st.columns(min(len(paths), 3))
             for i, url in enumerate(paths[:3]):
                 with cols[i % len(cols)]:
-                    # 동일 메시지에 여러 버튼이 있어도 유니크하도록 key 지정
+                    # 버튼마다 고유 key 필요
                     if st.button("이미지 미리보기", key=f"preview_{hash(url)}_{i}"):
-                        open_image_modal(url)
+                        image_modal(url)   # ← 함수 '호출'이 모달을 띄웁니다.
 
 def render_user_message(text: str):
     st.markdown(f'<div class="msg-row right"><div class="msg user">{text}</div></div>', unsafe_allow_html=True)
