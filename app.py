@@ -1,11 +1,8 @@
 # app.py — "🗨️그린(GREEN)톡톡💚" (B모드: 임베딩만, 생성 없음)
-# 요구사항 반영:
-#  - Google 스프레드시트 CSV를 우선 로드 (실패 시 로컬 엑셀 자동 인식)
-#  - 별도 파란 박스 제거, 페이지 채팅 영역 전체를 연파랑 배경으로
-#  - 카톡형 말풍선(사용자 오른쪽, 봇 왼쪽)
-#  - 스몰톡(인사/이름/기능/나이/만든 사람/이해못함)
-#  - 첫 메시지: intent 목록을 친절히 안내 후 “무엇이 궁금하세요?”
-#  - ✅ 엑셀/시트 images 컬럼 지원: "assets/a.png; https://.../b.jpg" 형식, 최대 3장 표시
+# - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
+# - 컬럼명 자동 정규화(대/소문자, 공백/한글 별칭)
+# - 카톡형 UI, 스몰톡, 첫 안내
+# - ✅ images 컬럼 지원(+ 핫링크 차단 우회: 서버에서 이미지 바이트로 받아 표시)
 
 import os, glob, re, time
 import numpy as np
@@ -14,6 +11,11 @@ import streamlit as st
 
 from google import genai
 from google.genai import types
+
+# -------- 추가: 외부 이미지 핫링크 우회를 위한 의존성 --------
+import requests
+from io import BytesIO
+from urllib.parse import urlparse
 
 # ===== (시연용) API Key 하드코딩 =====
 API_KEY = "AIzaSyBklAdqxHazyHmEyJO6LD3kPzANiqc6u3o"
@@ -32,39 +34,20 @@ BOT_NAME      = "GREEN 톡톡"
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💚", layout="centered")
 
-# ===== CSS (페이지 전역 채팅 영역을 연파랑 배경으로) =====
+# ===== CSS =====
 st.markdown("""
 <style>
-/* 중앙 폭 및 전체 배경 */
 .main { max-width: 860px; margin: 0 auto; }
-.block-container {
-  background: #F6FAFF !important;   /* 연한 파랑 */
-  border-radius: 12px;
-  padding: 16px 24px 24px 24px;
-}
-
-/* 제목 영역 */
+.block-container { background: #F6FAFF !important; border-radius: 12px; padding: 16px 24px 24px; }
 .title-wrap { padding: 8px 4px 0 4px; margin-bottom: 8px; background: transparent; }
 
-/* 메시지 말풍선 */
 .msg-row { display:flex; margin:8px 0; width:100%; }
-.msg {
-  display:inline-block; max-width:78%;
-  padding:10px 14px; border-radius:16px;
-  word-break:break-word; line-height:1.45;
-  box-shadow:0 1px 0 rgba(0,0,0,0.03);
-}
-.right { justify-content:flex-end; }
-.left  { justify-content:flex-start; }
+.msg { display:inline-block; max-width:78%; padding:10px 14px; border-radius:16px;
+       word-break:break-word; line-height:1.45; box-shadow:0 1px 0 rgba(0,0,0,0.03); }
+.right { justify-content:flex-end; } .left { justify-content:flex-start; }
 .msg.user { background:#FEE500; color:#111; border-top-right-radius:6px; }
-.msg.bot  { background:#fff;    color:#111; border-top-left-radius:6px; border:1px solid #ECF0F6; }
+.msg.bot  { background:#fff; color:#111; border-top-left-radius:6px; border:1px solid #ECF0F6; }
 
-/* 봇 답변 아래 이미지 그리드 */
-.media-row { display:flex; gap:8px; margin:6px 0 12px 0; }
-.media-col { flex:1; }
-.media-col img { border-radius:10px; border:1px solid #ECF0F6; }
-
-/* chat_input 라벨 축소 */
 label[for="chat_input"] { font-size:0; }
 </style>
 """, unsafe_allow_html=True)
@@ -103,11 +86,32 @@ def _clean_images_field(val) -> str:
     if not s or s.lower() == "nan": return ""
     return s
 
+# ===== 컬럼명 정규화 도우미 =====
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    def _norm(s):
+        s = str(s).strip().lower()
+        s = re.sub(r"[\s\-\u00A0]+", "", s)  # 공백/하이픈/불가시 공백 제거
+        return s
+    df = df.rename(columns=_norm)
+    # 한글/변형 별칭 매핑
+    alias = {
+        "의도": "intent", "질문그룹": "intent",
+        "답": "answer", "답변": "answer",
+        "이미지": "images", "사진": "images",
+        "질문1": "q1", "질문2": "q2", "질문3": "q3", "질문4": "q4", "질문5": "q5",
+        "q01": "q1", "q02": "q2", "q03": "q3", "q04": "q4", "q05": "q5",
+        "q1": "q1", "q2": "q2", "q3": "q3", "q4": "q4", "q5": "q5",
+        "intent": "intent", "answer": "answer", "images": "images"
+    }
+    for k, v in alias.items():
+        if k in df.columns and v not in df.columns:
+            df = df.rename(columns={k: v})
+    return df
+
 # ===== KB 빌드 (✅ images 포함) =====
 def build_kb(df: pd.DataFrame):
-    """
-    필요 컬럼: intent, answer, q1~q5(최소 q1~q3), images(선택)
-    """
+    df = _normalize_columns(df)
+
     rows = []
     for _, r in df.iterrows():
         answer = str(r.get("answer", "")).strip()
@@ -120,7 +124,8 @@ def build_kb(df: pd.DataFrame):
             continue
         for q in qs:
             rows.append({"intent": intent, "answer": answer, "q": q, "images": images})
-    if not rows: return None
+    if not rows: 
+        return None
     vecs = embed_texts([r["q"] for r in rows], task_type="RETRIEVAL_DOCUMENT")
     mat  = l2_normalize(np.vstack(vecs))
     return rows, mat
@@ -143,8 +148,7 @@ def auto_find_excel():
         if os.path.isfile(p): return p
     others = glob.glob(os.path.join(cwd, "*.xlsx"))
     if others:
-        # 한글 파일명 포함, 최신 수정 파일 우선
-        others.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        others.sort(key=lambda p: os.path.getmtime(p), reverse=True)  # 최신 수정
         return others[0]
     return None
 
@@ -154,10 +158,10 @@ def load_excel(path: str):
 
 # ===== (신규) 스프레드시트 우선 로더 =====
 def load_excel_or_gsheet():
-    # 1) 구글시트 CSV 먼저 시도
     if GSHEET_CSV_URL:
         try:
-            df = pd.read_csv(GSHEET_CSV_URL)
+            # keep_default_na=False: 빈 셀을 ""로 받아 처리 편의
+            df = pd.read_csv(GSHEET_CSV_URL, encoding="utf-8", keep_default_na=False)
             kb = build_kb(df)
             if kb:
                 return kb, "gsheet"
@@ -166,7 +170,6 @@ def load_excel_or_gsheet():
         except Exception as e:
             st.warning(f"스프레드시트(CSV) 로드 실패, 로컬 엑셀을 시도합니다: {e}")
 
-    # 2) 로컬 엑셀 폴백
     path = auto_find_excel()
     if path:
         try:
@@ -181,48 +184,51 @@ def load_excel_or_gsheet():
 def smalltalk_reply(text: str):
     t = text.strip().lower()
 
-    # 이름/호칭
     if re.search(r"(너.*이름|이름이 뭐|who are you|what.*name)", t):
         return f"제 이름은 {BOT_NAME}이에요. 반가워요! 💚"
-
-    # 인사
     if re.search(r"(안녕|안녕하세요|하이|헬로|hello|hi)", t):
         return f"안녕하세요! 저는 {BOT_NAME}이에요. 전 친구들이 설계한 질문에 대한 답변을 드리는 챗봇이에요. 많은 도움이 되었으면 좋겠어요 🙂"
-
-    # 기능/역할
     if re.search(r"(뭐(를)? 할 수|무엇을 할 수|무슨 기능|설명해줘|너.*할 수|역할|무얼 해)", t):
-        return "엑셀에 등록된 질문 변형과 가장 가까운 문장을 찾아, 등록된 ‘공식 답’을 그대로 알려주는 챗봇이에요. 등록이 없거나 유사도가 낮으면 답하지 않아요."
-
-    # 나이
+        return "엑셀(또는 시트)에 등록된 질문 변형과 가장 가까운 문장을 찾아, 등록된 ‘공식 답’을 알려주는 챗봇이에요. 등록이 없거나 유사도가 낮으면 답하지 않아요."
     if re.search(r"(몇살|나이|how old)", t):
         return "저는 나이는 없지만 언제나 수업을 도우려고 준비된 초등학교 챗봇이에요!"
-
-    # 만든 사람
     if re.search(r"(누가 만들|만든 사람|creator|developer)", t):
         return "저는 선생님과 함께 만들어진 GREEN 톡톡이에요. 교실에서 안전하게 쓰이도록 설계됐어요."
-
-    # 이해 못함
     if re.search(r"(무슨 말|이해.*안|모르겠)", t):
         return "조금만 더 구체적으로 말해줄래요? 예: ‘숙제 제출 시간 알려줘’처럼요."
     return None
 
-# ===== 유틸: intent 목록을 자연어로 예쁘게 =====
-def prettify_intents(intents: list[str]) -> str:
-    # 예) "숙제_제출" -> "숙제 제출"
-    cleaned = []
-    for x in intents:
-        x = (x or "").strip()
-        if not x: continue
-        x = x.replace("_", " ")
-        cleaned.append(x)
-    # 보기 좋게 쉼표로 연결
-    return ", ".join(cleaned)
+# ===== 이미지 핫링크 차단 우회: 서버에서 바이트로 받아오기 =====
+def fetch_image_bytes(url: str, timeout: int = 10):
+    try:
+        parsed = urlparse(url)
+        referer = f"{parsed.scheme}://{parsed.netloc}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0 Safari/537.36",
+            "Referer": referer,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Connection": "close",
+        }
+        resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        resp.raise_for_status()
 
-# ===== 렌더 유틸: 봇/유저 메시지 (봇은 이미지 지원) =====
+        ctype = resp.headers.get("Content-Type", "").lower()
+        if not ctype.startswith("image/"):
+            raise ValueError(f"Invalid content-type: {ctype}")
+
+        max_bytes = 8 * 1024 * 1024  # 8MB 방어
+        data = resp.raw.read(max_bytes + 1, decode_content=True)
+        if len(data) > max_bytes:
+            raise ValueError("image too large")
+        return BytesIO(data)
+    except Exception:
+        return None
+
+# ===== 렌더 유틸 =====
 def render_bot_message(text: str, images_field: str | None = None):
-    # 텍스트 버블
     st.markdown(f'<div class="msg-row left"><div class="msg bot">{text}</div></div>', unsafe_allow_html=True)
-    # 이미지가 있으면 아래에 그리드로 표시 (최대 3장)
     if images_field:
         paths = [p.strip() for p in str(images_field).split(";") if p.strip()]
         if paths:
@@ -230,10 +236,19 @@ def render_bot_message(text: str, images_field: str | None = None):
             cols = st.columns(n)
             for i in range(n):
                 with cols[i]:
+                    url = paths[i]
                     try:
-                        st.image(paths[i], use_container_width=True)
+                        if url.startswith("http"):
+                            buf = fetch_image_bytes(url)
+                            if buf:
+                                st.image(buf, use_container_width=True)
+                            else:
+                                # 마지막 시도로 브라우저 직접 로드
+                                st.image(url, use_container_width=True)
+                        else:
+                            st.image(url, use_container_width=True)
                     except Exception:
-                        st.write("이미지를 불러올 수 없어요:", paths[i])
+                        st.write("이미지를 불러올 수 없어요:", url)
 
 def render_user_message(text: str):
     st.markdown(f'<div class="msg-row right"><div class="msg user">{text}</div></div>', unsafe_allow_html=True)
@@ -241,7 +256,7 @@ def render_user_message(text: str):
 # ===== 세션 상태 =====
 if "kb" not in st.session_state:          st.session_state.kb = None
 if "messages" not in st.session_state:    st.session_state.messages = []  # [{role,text,images?,ts}]
-if "welcomed" not in st.session_state:    st.session_state.welcomed = False  # 첫 안내 메시지 중복 방지
+if "welcomed" not in st.session_state:    st.session_state.welcomed = False
 
 # ===== KB 로드(스프레드시트 우선) + 첫 안내 =====
 if st.session_state.kb is None:
@@ -255,12 +270,12 @@ if st.session_state.kb is None:
     else:
         st.info("GSHEET_CSV_URL에서 불러오지 못했습니다. 같은 폴더에 엑셀(.xlsx)을 두면 자동 인식합니다. (예: qa.xlsx)")
 
-# KB가 있고 아직 환영 메시지를 안 보냈다면 intents로 첫 메시지 안내
+# 첫 안내 메시지
 if st.session_state.kb and not st.session_state.welcomed:
     kb_rows, _ = st.session_state.kb
     intents = sorted(set([r["intent"] for r in kb_rows if r.get("intent")]))
     if intents:
-        intents_txt = prettify_intents(intents)
+        intents_txt = ", ".join([x.replace("_", " ") for x in intents if (x or "").strip()])
         first_msg = (
             f"안녕하세요! 저는 {BOT_NAME}이에요 💚\n\n"
             f"저는 이런 주제들에 대해 대답할 수 있어요:\n\n"
@@ -276,36 +291,34 @@ for m in st.session_state.messages:
     if m["role"] == "user":
         render_user_message(m["text"])
     else:
-        # Assistant 메시지는 images 가능
         render_bot_message(m["text"], m.get("images"))
 
 # ===== 입력창 =====
 user_input = st.chat_input("질문을 입력하세요… (예: 숙제 언제까지 내나요?)", key="chat_input")
 if user_input:
-    # 사용자 메시지 저장
     st.session_state.messages.append({"role":"user","text":user_input,"ts":time.time()})
 
-    # 1) KB 검색
     reply = None
     reply_images = None
+
+    # 1) KB 검색
     if st.session_state.kb:
         kb_rows, kb_mat = st.session_state.kb
         top_row, top_score = retrieve_top1(user_input, kb_rows, kb_mat)
         if top_row is not None and top_score >= SIM_THRESHOLD:
             reply = top_row["answer"]
-            reply_images = _clean_images_field(top_row.get("images"))  # 매칭된 행의 images 사용
+            reply_images = _clean_images_field(top_row.get("images"))
 
     # 2) 스몰톡
     if reply is None:
         reply = smalltalk_reply(user_input)
-        reply_images = None  # 스몰톡에는 이미지 미첨부
+        reply_images = None
 
     # 3) 최종 실패
     if reply is None:
         reply = NO_MATCH_MSG
         reply_images = None
 
-    # 저장(이미지 포함) & 즉시 갱신
     st.session_state.messages.append({
         "role":"assistant",
         "text":reply,
