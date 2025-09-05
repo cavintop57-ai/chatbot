@@ -2,7 +2,7 @@
 # - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
 # - 컬럼명 자동 정규화(대/소문자, 공백/한글 별칭)
 # - 카톡형 UI, 스몰톡, 첫 안내
-# - ✅ images 컬럼 지원(+ 핫링크 차단 우회: 서버에서 이미지 바이트로 받아 표시, 프록시 백업)
+# - ✅ images 컬럼: 서버에서 직접 로드 + 프록시(weserv/duck) 백업, 20MB 한도
 
 import os, glob, re, time
 import numpy as np
@@ -12,7 +12,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# ---- 외부 이미지 핫링크 우회용 의존성 ----
+# ---- 외부 이미지 핫링크 우회용 ----
 import requests
 from io import BytesIO
 from urllib.parse import urlparse, quote
@@ -86,14 +86,13 @@ def _clean_images_field(val) -> str:
     if not s or s.lower() == "nan": return ""
     return s
 
-# ===== 컬럼명 정규화 도우미 =====
+# ===== 컬럼명 정규화 =====
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     def _norm(s):
         s = str(s).strip().lower()
         s = re.sub(r"[\s\-\u00A0]+", "", s)  # 공백/하이픈/불가시 공백 제거
         return s
     df = df.rename(columns=_norm)
-    # 한글/변형 별칭 매핑
     alias = {
         "의도": "intent", "질문그룹": "intent",
         "답": "answer", "답변": "answer",
@@ -111,16 +110,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # ===== KB 빌드 (✅ images 포함) =====
 def build_kb(df: pd.DataFrame):
     df = _normalize_columns(df)
-
     rows = []
     for _, r in df.iterrows():
         answer = str(r.get("answer", "")).strip()
-        if not answer:    # answer 필수
+        if not answer:
             continue
         intent = str(r.get("intent", "")).strip()
-        images = _clean_images_field(r.get("images", ""))  # 선택 컬럼
+        images = _clean_images_field(r.get("images", ""))
         qs = [str(r.get(f"q{i}", "")).strip() for i in range(1,6) if str(r.get(f"q{i}", "")).strip()]
-        if len(qs) < 3:   # 최소 3개 질문 변형
+        if len(qs) < 3:
             continue
         for q in qs:
             rows.append({"intent": intent, "answer": answer, "q": q, "images": images})
@@ -148,7 +146,7 @@ def auto_find_excel():
         if os.path.isfile(p): return p
     others = glob.glob(os.path.join(cwd, "*.xlsx"))
     if others:
-        others.sort(key=lambda p: os.path.getmtime(p), reverse=True)  # 최신 수정
+        others.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return others[0]
     return None
 
@@ -196,57 +194,64 @@ def smalltalk_reply(text: str):
         return "조금만 더 구체적으로 말해줄래요? 예: ‘숙제 제출 시간 알려줘’처럼요."
     return None
 
-# ===== 이미지 핫링크 차단 우회: 서버에서 바이트로 받아오기(+프록시 백업) =====
-def fetch_image_bytes(url: str, timeout: int = 12):
+# ===== 이미지: 서버에서 직접 로드 + 프록시 백업 =====
+def proxy_urls(url: str):
+    no_scheme = url.replace("https://", "").replace("http://", "")
+    return [
+        f"https://images.weserv.nl/?url={quote(no_scheme, safe='')}&w=1200&output=jpg",
+        f"https://proxy.duckduckgo.com/iu/?u={quote(url, safe='')}&f=1",
+    ]
+
+def fetch_image_bytes(url: str, timeout: int = 15):
     """
-    1) 기본 요청
-    2) UA만
-    3) UA+Referer
-    4) images.weserv.nl 프록시 백업
+    1) 직접 요청(기본 → UA → UA+Referer)
+    2) 프록시(weserv, duck)로 바이트 받아오기
     성공 시 BytesIO, 실패 시 None
     """
-    def _try(headers=None):
+    MAX_BYTES = 20 * 1024 * 1024  # 20MB
+
+    def _try(u, headers=None):
         try:
-            resp = requests.get(url, headers=headers or {}, timeout=timeout)
+            resp = requests.get(u, headers=headers or {}, timeout=timeout)
             resp.raise_for_status()
-            ctype = resp.headers.get("Content-Type", "").lower()
+            data = resp.content or b""
+            if not data:
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").lower()
             if ("image" not in ctype and
-                not resp.content.startswith(b"\x89PNG") and
-                not resp.content.startswith(b"\xff\xd8")):  # JPEG/PNG 시그니처
+                not data.startswith(b"\x89PNG") and
+                not data.startswith(b"\xff\xd8") and
+                not data[:12].lower().startswith(b"riff")  # webp
+            ):
                 return None
-            if len(resp.content) > 10 * 1024 * 1024:  # 10MB 방어
+            if len(data) > MAX_BYTES:
                 return None
-            return BytesIO(resp.content)
+            return BytesIO(data)
         except Exception:
             return None
 
-    # 1) 기본
-    buf = _try()
+    # 1-1) 기본
+    buf = _try(url)
     if buf: return buf
 
-    # 2) UA만
+    # 1-2) UA만
     ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
-    buf = _try(ua)
+    buf = _try(url, ua)
     if buf: return buf
 
-    # 3) UA + Referer + Accept
+    # 1-3) UA+Referer+Accept
     parsed = urlparse(url)
     headers = dict(ua)
     headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
     headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-    buf = _try(headers)
+    buf = _try(url, headers)
     if buf: return buf
 
-    # 4) 공개 프록시(weserv) 백업
-    try:
-        no_scheme = url.replace("https://", "").replace("http://", "")
-        proxy_url = f"https://images.weserv.nl/?url={quote(no_scheme, safe='')}"
-        resp = requests.get(proxy_url, timeout=timeout)
-        resp.raise_for_status()
-        if resp.content:
-            return BytesIO(resp.content)
-    except Exception:
-        pass
+    # 2) 프록시들
+    for purl in proxy_urls(url):
+        buf = _try(purl, ua)
+        if buf:
+            return buf
 
     return None
 
@@ -267,8 +272,18 @@ def render_bot_message(text: str, images_field: str | None = None):
                             if buf:
                                 st.image(buf, use_container_width=True)
                             else:
-                                st.write("이미지를 불러올 수 없어요:")
-                                st.markdown(f"<small><a href='{url}' target='_blank'>{url}</a></small>", unsafe_allow_html=True)
+                                # 최후: 프록시 URL 자체를 <img>로 시도
+                                shown = False
+                                for p in proxy_urls(url):
+                                    try:
+                                        st.image(p, use_container_width=True)
+                                        shown = True
+                                        break
+                                    except Exception:
+                                        pass
+                                if not shown:
+                                    st.write("이미지를 불러올 수 없어요:")
+                                    st.markdown(f"<small><a href='{url}' target='_blank'>{url}</a></small>", unsafe_allow_html=True)
                         else:
                             st.image(url, use_container_width=True)
                     except Exception:
