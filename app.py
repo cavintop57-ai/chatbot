@@ -2,7 +2,7 @@
 # - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
 # - 컬럼명 자동 정규화(대/소문자, 공백/한글 별칭)
 # - 카톡형 UI, 스몰톡, 첫 안내
-# - ✅ images 컬럼 지원(+ 핫링크 차단 우회: 서버에서 이미지 바이트로 받아 표시)
+# - ✅ images 컬럼 지원(+ 핫링크 차단 우회: 서버에서 이미지 바이트로 받아 표시, 프록시 백업)
 
 import os, glob, re, time
 import numpy as np
@@ -12,10 +12,10 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# -------- 추가: 외부 이미지 핫링크 우회를 위한 의존성 --------
+# ---- 외부 이미지 핫링크 우회용 의존성 ----
 import requests
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 # ===== (시연용) API Key 하드코딩 =====
 API_KEY = "AIzaSyBklAdqxHazyHmEyJO6LD3kPzANiqc6u3o"
@@ -124,7 +124,7 @@ def build_kb(df: pd.DataFrame):
             continue
         for q in qs:
             rows.append({"intent": intent, "answer": answer, "q": q, "images": images})
-    if not rows: 
+    if not rows:
         return None
     vecs = embed_texts([r["q"] for r in rows], task_type="RETRIEVAL_DOCUMENT")
     mat  = l2_normalize(np.vstack(vecs))
@@ -156,11 +156,10 @@ def load_excel(path: str):
     df = pd.read_excel(path)
     return build_kb(df)
 
-# ===== (신규) 스프레드시트 우선 로더 =====
+# ===== 스프레드시트 우선 로더 =====
 def load_excel_or_gsheet():
     if GSHEET_CSV_URL:
         try:
-            # keep_default_na=False: 빈 셀을 ""로 받아 처리 편의
             df = pd.read_csv(GSHEET_CSV_URL, encoding="utf-8", keep_default_na=False)
             kb = build_kb(df)
             if kb:
@@ -183,7 +182,6 @@ def load_excel_or_gsheet():
 # ===== 스몰톡(규칙 기반) =====
 def smalltalk_reply(text: str):
     t = text.strip().lower()
-
     if re.search(r"(너.*이름|이름이 뭐|who are you|what.*name)", t):
         return f"제 이름은 {BOT_NAME}이에요. 반가워요! 💚"
     if re.search(r"(안녕|안녕하세요|하이|헬로|hello|hi)", t):
@@ -198,33 +196,59 @@ def smalltalk_reply(text: str):
         return "조금만 더 구체적으로 말해줄래요? 예: ‘숙제 제출 시간 알려줘’처럼요."
     return None
 
-# ===== 이미지 핫링크 차단 우회: 서버에서 바이트로 받아오기 =====
-def fetch_image_bytes(url: str, timeout: int = 10):
+# ===== 이미지 핫링크 차단 우회: 서버에서 바이트로 받아오기(+프록시 백업) =====
+def fetch_image_bytes(url: str, timeout: int = 12):
+    """
+    1) 기본 요청
+    2) UA만
+    3) UA+Referer
+    4) images.weserv.nl 프록시 백업
+    성공 시 BytesIO, 실패 시 None
+    """
+    def _try(headers=None):
+        try:
+            resp = requests.get(url, headers=headers or {}, timeout=timeout)
+            resp.raise_for_status()
+            ctype = resp.headers.get("Content-Type", "").lower()
+            if ("image" not in ctype and
+                not resp.content.startswith(b"\x89PNG") and
+                not resp.content.startswith(b"\xff\xd8")):  # JPEG/PNG 시그니처
+                return None
+            if len(resp.content) > 10 * 1024 * 1024:  # 10MB 방어
+                return None
+            return BytesIO(resp.content)
+        except Exception:
+            return None
+
+    # 1) 기본
+    buf = _try()
+    if buf: return buf
+
+    # 2) UA만
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    buf = _try(ua)
+    if buf: return buf
+
+    # 3) UA + Referer + Accept
+    parsed = urlparse(url)
+    headers = dict(ua)
+    headers["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
+    headers["Accept"] = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    buf = _try(headers)
+    if buf: return buf
+
+    # 4) 공개 프록시(weserv) 백업
     try:
-        parsed = urlparse(url)
-        referer = f"{parsed.scheme}://{parsed.netloc}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/124.0 Safari/537.36",
-            "Referer": referer,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Connection": "close",
-        }
-        resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        no_scheme = url.replace("https://", "").replace("http://", "")
+        proxy_url = f"https://images.weserv.nl/?url={quote(no_scheme, safe='')}"
+        resp = requests.get(proxy_url, timeout=timeout)
         resp.raise_for_status()
-
-        ctype = resp.headers.get("Content-Type", "").lower()
-        if not ctype.startswith("image/"):
-            raise ValueError(f"Invalid content-type: {ctype}")
-
-        max_bytes = 8 * 1024 * 1024  # 8MB 방어
-        data = resp.raw.read(max_bytes + 1, decode_content=True)
-        if len(data) > max_bytes:
-            raise ValueError("image too large")
-        return BytesIO(data)
+        if resp.content:
+            return BytesIO(resp.content)
     except Exception:
-        return None
+        pass
+
+    return None
 
 # ===== 렌더 유틸 =====
 def render_bot_message(text: str, images_field: str | None = None):
@@ -243,12 +267,13 @@ def render_bot_message(text: str, images_field: str | None = None):
                             if buf:
                                 st.image(buf, use_container_width=True)
                             else:
-                                # 마지막 시도로 브라우저 직접 로드
-                                st.image(url, use_container_width=True)
+                                st.write("이미지를 불러올 수 없어요:")
+                                st.markdown(f"<small><a href='{url}' target='_blank'>{url}</a></small>", unsafe_allow_html=True)
                         else:
                             st.image(url, use_container_width=True)
                     except Exception:
-                        st.write("이미지를 불러올 수 없어요:", url)
+                        st.write("이미지를 불러올 수 없어요:")
+                        st.markdown(f"<small><a href='{url}' target='_blank'>{url}</a></small>", unsafe_allow_html=True)
 
 def render_user_message(text: str):
     st.markdown(f'<div class="msg-row right"><div class="msg user">{text}</div></div>', unsafe_allow_html=True)
