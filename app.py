@@ -2,7 +2,9 @@
 # - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
 # - 컬럼명 자동 정규화
 # - 카톡형 UI, 스몰톡, 첫 안내
-# - ✅ images 컬럼: 직접 표시 시도 → 실패하면 안내 문구 + "이미지 열기 (새 탭)" 버튼 제공
+# - ✅ images: 서버에서 bytes로 받아 표시(UA/Referer 재시도) → 프록시(weserv/duck) 백업
+#             썸네일(말풍선 아래) + "크게 보기" 모달, 최후엔 새 탭 버튼 폴백
+#             (st.image에 BytesIO 대신 raw bytes 전달로 안정화)
 
 import os, glob, re, time
 import numpy as np
@@ -12,10 +14,10 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# (이미지 직접 표시 실패 시 버튼만 제공하므로 외부 프록시는 사용하지 않습니다)
-# 필요시 requests 등 추가 의존성 없이 동작
+import requests
+from urllib.parse import urlparse, quote
 
-# ===== API Key =====
+# ===== API Key (시연용 하드코딩) =====
 API_KEY = "AIzaSyBklAdqxHazyHmEyJO6LD3kPzANiqc6u3o"
 
 # ===== Google 스프레드시트 CSV URL =====
@@ -47,6 +49,8 @@ st.markdown("""
 .msg.bot  { background:#fff; color:#111; border-top-left-radius:6px; border:1px solid #ECF0F6; }
 
 .small-note { font-size: 0.9rem; color: #4a5568; margin: 6px 0 4px 4px; }
+.thumb-wrap { margin: 6px 0 2px 6px; }
+.thumb-btn { margin-top: 4px; }
 
 label[for="chat_input"] { font-size:0; }
 </style>
@@ -170,35 +174,107 @@ def load_excel_or_gsheet():
             st.error(f"엑셀 로드 실패: {e}")
     return None, None
 
-# ===== 스몰톡 =====
-def smalltalk_reply(text: str):
-    t = text.strip().lower()
-    if re.search(r"(너.*이름|이름이 뭐|who are you|what.*name)", t):
-        return f"제 이름은 {BOT_NAME}이에요. 반가워요! 💚"
-    if re.search(r"(안녕|안녕하세요|하이|헬로|hello|hi)", t):
-        return f"안녕하세요! 저는 {BOT_NAME}이에요. 전 친구들이 설계한 질문에 대한 답변을 드리는 챗봇이에요 🙂"
-    if re.search(r"(뭐(를)? 할 수|무엇을 할 수|무슨 기능|설명해줘|역할)", t):
-        return "저는 시트에 등록된 질문과 답변을 연결해주는 챗봇이에요."
-    if re.search(r"(몇살|나이|how old)", t):
-        return "저는 나이는 없지만 언제나 수업을 도우려고 준비된 챗봇이에요!"
-    if re.search(r"(누가 만들|만든 사람|creator|developer)", t):
-        return "저는 선생님과 함께 만들어진 GREEN 톡톡이에요."
-    return None
+# ===== 이미지 fetch/프록시 =====
+def proxy_urls(url: str):
+    no_scheme = url.replace("https://", "").replace("http://", "")
+    return [
+        f"https://images.weserv.nl/?url={quote(no_scheme, safe='')}&w=1200&output=jpg",
+        f"https://proxy.duckduckgo.com/iu/?u={quote(url, safe='')}&f=1",
+    ]
 
-# ===== 이미지 표시: 실패 시 버튼으로 유도 =====
+def fetch_image_bytes(url: str, timeout: int = 15, max_bytes: int = 20 * 1024 * 1024):
+    """직접 요청 → UA → UA+Referer → 프록시 2종 순으로 바이트 획득.
+       성공 시 (bytes, mime) 반환, 실패 시 (None, None)"""
+    def _try(u, headers=None):
+        try:
+            resp = requests.get(u, headers=headers or {}, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.content or b""
+            if not data or len(data) > max_bytes:
+                return None, None
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            # 이미지 시그니처/타입 대충 확인
+            sig_ok = (
+                data.startswith(b"\x89PNG") or     # PNG
+                data.startswith(b"\xff\xd8") or     # JPEG
+                data[:12].lower().startswith(b"riff") or  # WEBP
+                "image" in ctype
+            )
+            if not sig_ok:
+                return None, None
+            return data, ctype
+        except Exception:
+            return None, None
+
+    # 1) 기본
+    data, mime = _try(url)
+    if data: return data, mime
+    # 2) UA
+    ua = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+    data, mime = _try(url, ua)
+    if data: return data, mime
+    # 3) UA + Referer + Accept
+    parsed = urlparse(url)
+    hdr = dict(ua)
+    hdr["Referer"] = f"{parsed.scheme}://{parsed.netloc}"
+    hdr["Accept"]  = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    data, mime = _try(url, hdr)
+    if data: return data, mime
+    # 4) 프록시들
+    for p in proxy_urls(url):
+        data, mime = _try(p, ua)
+        if data: return data, mime
+    return None, None
+
+# ===== 모달(데코레이터) — 크게 보기 =====
+@st.dialog("이미지 미리보기", width="large")
+def image_modal(url: str):
+    data, _ = fetch_image_bytes(url, timeout=18, max_bytes=25 * 1024 * 1024)
+    if data:
+        st.image(data, use_container_width=True)
+    else:
+        st.markdown(
+            "<div class='small-note'>이 이미지는 보안 정책 때문에 직접 표시가 어려워요. "
+            "아래 버튼을 눌러 <b>새 탭</b>에서 확인해 보세요 👇</div>",
+            unsafe_allow_html=True
+        )
+        st.link_button("이미지 열기 (새 탭)", url)
+
+# ===== 렌더 유틸 =====
 def render_bot_message(text: str, images_field: str | None = None):
+    # 텍스트 말풍선
     st.markdown(f'<div class="msg-row left"><div class="msg bot">{text}</div></div>', unsafe_allow_html=True)
+
+    # 이미지 썸네일 (최대 3장)
     if images_field:
         paths = [p.strip() for p in str(images_field).split(";") if p.strip()]
         if paths:
             cols = st.columns(min(len(paths), 3))
             for i, url in enumerate(paths[:3]):
                 with cols[i % len(cols)]:
-                    try:
-                        st.image(url, use_container_width=True)
-                    except Exception:
-                        st.markdown("<div class='small-note'>사진을 준비했어요. 아래 버튼을 누르면 답변에 준비된 사진을 확인하실 수 있습니다~! 👇</div>", unsafe_allow_html=True)
-                        # Streamlit 1.25+ : 링크 버튼
+                    data, _ = fetch_image_bytes(url)
+                    if data:
+                        st.markdown("<div class='thumb-wrap'>", unsafe_allow_html=True)
+                        try:
+                            st.image(data, use_container_width=True)
+                            if st.button("크게 보기", key=f"zoom_{hash(url)}_{i}", help="모달로 크게 보기"):
+                                image_modal(url)
+                        except Exception:
+                            # st.image에서 또 예외가 나면 버튼 폴백
+                            st.markdown(
+                                "<div class='small-note'>이미지를 직접 표시하지 못했어요. "
+                                "아래 버튼을 눌러 <b>새 탭</b>에서 확인해 보세요 👇</div>",
+                                unsafe_allow_html=True
+                            )
+                            st.link_button("이미지 열기 (새 탭)", url)
+                        st.markdown("</div>", unsafe_allow_html=True)
+                    else:
+                        # 인라인 실패 → 안내 + 새 탭 버튼
+                        st.markdown(
+                            "<div class='small-note'>일부 사이트는 보안 정책으로 이미지 임베드를 막아요. "
+                            "아래 버튼을 눌러 <b>새 탭</b>에서 확인해 보세요 👇</div>",
+                            unsafe_allow_html=True
+                        )
                         st.link_button("이미지 열기 (새 탭)", url)
 
 def render_user_message(text: str):
