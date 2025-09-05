@@ -2,7 +2,7 @@
 # - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
 # - 컬럼명 자동 정규화
 # - 카톡형 UI, 스몰톡, 첫 안내
-# - ✅ images 컬럼: 직접 표시 시도 → 실패하면 "이미지를 클릭해서 확인해 보세요 👇" 문구와 함께 링크 제공
+# - ✅ images 컬럼: 직접 표시 시도 → 실패하면 안내 문구 + "이미지 열기 (새 탭)" 버튼 제공
 
 import os, glob, re, time
 import numpy as np
@@ -12,9 +12,8 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-import requests
-from io import BytesIO
-from urllib.parse import urlparse, quote
+# (이미지 직접 표시 실패 시 버튼만 제공하므로 외부 프록시는 사용하지 않습니다)
+# 필요시 requests 등 추가 의존성 없이 동작
 
 # ===== API Key =====
 API_KEY = "AIzaSyBklAdqxHazyHmEyJO6LD3kPzANiqc6u3o"
@@ -46,6 +45,8 @@ st.markdown("""
 .right { justify-content:flex-end; } .left { justify-content:flex-start; }
 .msg.user { background:#FEE500; color:#111; border-top-right-radius:6px; }
 .msg.bot  { background:#fff; color:#111; border-top-left-radius:6px; border:1px solid #ECF0F6; }
+
+.small-note { font-size: 0.9rem; color: #4a5568; margin: 6px 0 4px 4px; }
 
 label[for="chat_input"] { font-size:0; }
 </style>
@@ -184,21 +185,21 @@ def smalltalk_reply(text: str):
         return "저는 선생님과 함께 만들어진 GREEN 톡톡이에요."
     return None
 
-# ===== 이미지 표시 =====
+# ===== 이미지 표시: 실패 시 버튼으로 유도 =====
 def render_bot_message(text: str, images_field: str | None = None):
     st.markdown(f'<div class="msg-row left"><div class="msg bot">{text}</div></div>', unsafe_allow_html=True)
     if images_field:
         paths = [p.strip() for p in str(images_field).split(";") if p.strip()]
-        for url in paths:
-            try:
-                st.image(url, use_container_width=True)
-            except Exception:
-                st.markdown(
-                    f"<div class='msg-row left'><div class='msg bot'>"
-                    f"이미지를 직접 불러올 수 없어요. 아래 링크를 눌러 새 탭에서 확인해 보세요 👇<br>"
-                    f"<a href='{url}' target='_blank'>{url}</a>"
-                    f"</div></div>", unsafe_allow_html=True
-                )
+        if paths:
+            cols = st.columns(min(len(paths), 3))
+            for i, url in enumerate(paths[:3]):
+                with cols[i % len(cols)]:
+                    try:
+                        st.image(url, use_container_width=True)
+                    except Exception:
+                        st.markdown("<div class='small-note'>사진 자료도 준비되어 있어요. 아래 버튼을 눌러보세요~! 👇</div>", unsafe_allow_html=True)
+                        # Streamlit 1.25+ : 링크 버튼
+                        st.link_button("이미지 열기 (새 탭)", url)
 
 def render_user_message(text: str):
     st.markdown(f'<div class="msg-row right"><div class="msg user">{text}</div></div>', unsafe_allow_html=True)
