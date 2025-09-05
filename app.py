@@ -2,7 +2,7 @@
 # - Google 스프레드시트 CSV 우선 로드(실패 시 로컬 엑셀 자동)
 # - 컬럼명 자동 정규화
 # - 카톡형 UI, 스몰톡, 첫 안내
-# - ✅ images 컬럼: 직접 표시 시도 → 실패하면 안내 문구 + "이미지 열기 (새 탭)" 버튼 제공
+# - ✅ images 컬럼: "이미지 미리보기" 버튼 → 모달로 표시 (모달 내 로드 실패 시 새 탭 버튼 안내)
 
 import os, glob, re, time
 import numpy as np
@@ -12,10 +12,7 @@ import streamlit as st
 from google import genai
 from google.genai import types
 
-# (이미지 직접 표시 실패 시 버튼만 제공하므로 외부 프록시는 사용하지 않습니다)
-# 필요시 requests 등 추가 의존성 없이 동작
-
-# ===== API Key =====
+# ===== API Key (시연용 하드코딩) =====
 API_KEY = "AIzaSyBklAdqxHazyHmEyJO6LD3kPzANiqc6u3o"
 
 # ===== Google 스프레드시트 CSV URL =====
@@ -185,21 +182,34 @@ def smalltalk_reply(text: str):
         return "저는 선생님과 함께 만들어진 GREEN 톡톡이에요."
     return None
 
-# ===== 이미지 표시: 실패 시 버튼으로 유도 =====
+# ===== 모달(다이얼로그)로 이미지 미리보기 =====
+def open_image_modal(url: str):
+    with st.dialog("이미지 미리보기", width="large"):
+        try:
+            st.image(url, use_container_width=True)
+        except Exception:
+            st.markdown(
+                "<div class='small-note'>이 이미지는 보안 정책 때문에 직접 표시가 어려워요. 아래 버튼을 눌러 새 탭에서 확인해 보세요 👇</div>",
+                unsafe_allow_html=True
+            )
+            st.link_button("이미지 열기 (새 탭)", url)
+
+# ===== 렌더 유틸 =====
 def render_bot_message(text: str, images_field: str | None = None):
+    # 텍스트 말풍선
     st.markdown(f'<div class="msg-row left"><div class="msg bot">{text}</div></div>', unsafe_allow_html=True)
+
+    # 이미지가 있으면: "미리보기 버튼"만 제공 → 클릭 시 모달로 크게 보기
     if images_field:
         paths = [p.strip() for p in str(images_field).split(";") if p.strip()]
         if paths:
+            st.markdown("<div class='small-note'>관련 이미지가 있어요. 버튼을 눌러 미리보기로 확인해 보세요 👇</div>", unsafe_allow_html=True)
             cols = st.columns(min(len(paths), 3))
             for i, url in enumerate(paths[:3]):
                 with cols[i % len(cols)]:
-                    try:
-                        st.image(url, use_container_width=True)
-                    except Exception:
-                        st.markdown("<div class='small-note'>사진 자료도 준비되어 있어요. 아래 버튼을 눌러보세요~! 👇</div>", unsafe_allow_html=True)
-                        # Streamlit 1.25+ : 링크 버튼
-                        st.link_button("이미지 열기 (새 탭)", url)
+                    # 동일 메시지에 여러 버튼이 있어도 유니크하도록 key 지정
+                    if st.button("이미지 미리보기", key=f"preview_{hash(url)}_{i}"):
+                        open_image_modal(url)
 
 def render_user_message(text: str):
     st.markdown(f'<div class="msg-row right"><div class="msg user">{text}</div></div>', unsafe_allow_html=True)
